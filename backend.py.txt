@@ -1,0 +1,471 @@
+from datetime import datetime
+import json
+from pathlib import Path
+import random
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+
+DATA_FILE = Path(__file__).with_name("shiftlink_data.json")
+
+TEXT_MANAGER = "教室長"
+TEXT_ACTIVE = "在籍"
+TEXT_NOT_SET = "未設定"
+TEXT_LOGIN_ERROR = "ログインIDまたはパスワードが正しくありません。"
+TEXT_REQUIRED_ERROR = "必須項目が入力されていません。"
+TEXT_DONE = "完了"
+TEXT_WAITING = "確認待ち"
+TEXT_CONFIRMED = "確認済み"
+TEXT_UNASSIGNED = "担当未定"
+TEXT_VISIT = "来校"
+TEXT_DEMO = "体験"
+TEXT_TEACHER = "担当"
+TEXT_STATUS = "状況"
+TEXT_GRADE_NOT_SET = "学年未設定"
+TEXT_SUBJECT_NOT_SET = "教科未設定"
+
+
+def default_data():
+    return {
+        "teachers": [
+            {
+                "teacherId": "T000",
+                "name": TEXT_MANAGER,
+                "loginId": "T000",
+                "password": "Manager123",
+                "role": "admin",
+                "status": TEXT_ACTIVE,
+                "memo": "",
+                "mustChangePassword": False,
+            }
+        ],
+        "shiftRequests": [],
+        "staffShifts": [],
+        "demoLessons": [],
+        "demoApplications": [],
+        "managerAbsences": [],
+        "notifications": [],
+        "settings": {"shiftDeadline": "", "future": {}},
+    }
+
+
+def normalize_text(value, default=""):
+    if value is None:
+        return default
+    text = str(value)
+    text = text.replace("　", " ")
+    return text.strip()
+
+
+def log_event(event_name, details=None):
+    if details is None:
+        details = {}
+    print("[ShiftLink] {}: {}".format(event_name, details))
+
+
+def get_input_payload():
+    payload = request.get_json(force=True) or {}
+    log_event("input received", {"keys": list(payload.keys())})
+    return payload
+
+
+def is_active_teacher(teacher):
+    return teacher.get("role") == "admin" or teacher.get("status") == TEXT_ACTIVE
+
+
+def generate_password():
+    password_parts = []
+
+    for i in range(0, 10):
+        number = random.randint(0, 9)
+        password_parts.append(str(number))
+
+    return "".join(password_parts)
+
+
+def validate_required_fields(data, required_fields):
+    missing_fields = []
+
+    for field_name in required_fields:
+        if not normalize_text(data.get(field_name)):
+            missing_fields.append(field_name)
+
+    return missing_fields
+
+
+def count_by_key(rows, key_name):
+    counts = {}
+
+    for row in rows:
+        key = normalize_text(row.get(key_name), TEXT_NOT_SET)
+        if key not in counts:
+            counts[key] = 0
+        counts[key] += 1
+
+    return counts
+
+
+def unique_values(rows, key_name):
+    values = set()
+
+    for row in rows:
+        value = normalize_text(row.get(key_name))
+        if value:
+            values.add(value)
+
+    return values
+
+
+def prepare_teacher_input(input_data):
+    teacher = dict(input_data)
+    input_items = [
+        ("teacherId", ""),
+        ("name", ""),
+        ("loginId", teacher.get("teacherId", "")),
+        ("role", "teacher"),
+        ("status", TEXT_ACTIVE),
+        ("memo", ""),
+    ]
+
+    for key, default_value in input_items:
+        teacher[key] = normalize_text(teacher.get(key), default_value)
+
+    if not normalize_text(teacher.get("password")):
+        teacher["password"] = generate_password()
+
+    if "mustChangePassword" not in teacher:
+        teacher["mustChangePassword"] = True
+
+    return teacher
+
+
+def demo_sort_key(demo):
+    return (
+        normalize_text(demo.get("date")),
+        normalize_text(demo.get("visitTime")),
+        normalize_text(demo.get("demoTime")),
+    )
+
+
+def demo_public_label(demo):
+    grade = normalize_text(demo.get("grade"), TEXT_GRADE_NOT_SET)
+    subject = normalize_text(demo.get("subject"), TEXT_SUBJECT_NOT_SET)
+    return "{} {}".format(grade, subject)
+
+
+class JsonStore:
+    def __init__(self, path):
+        self.path = path
+
+    def load(self):
+        if not self.path.exists():
+            self.save(default_data())
+
+        with self.path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+
+    def save(self, data):
+        with self.path.open("w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+
+    def upsert(self, table_name, key_name, item):
+        data = self.load()
+        rows = data.setdefault(table_name, [])
+        updated = False
+
+        for index, row in enumerate(rows):
+            if row.get(key_name) == item.get(key_name):
+                rows[index] = {**row, **item}
+                updated = True
+                break
+
+        if not updated:
+            rows.append(item)
+
+        self.save(data)
+        return item
+
+    def replace_table(self, table_name, rows):
+        data = self.load()
+        data[table_name] = rows
+        self.save(data)
+        return rows
+
+
+class ShiftLinkService:
+    def __init__(self, store):
+        self.store = store
+
+    def authenticate(self, login_id, password):
+        data = self.store.load()
+        login_id = normalize_text(login_id)
+        password = normalize_text(password)
+
+        for teacher in data.get("teachers", []):
+            same_id = teacher.get("loginId") == login_id
+            same_password = teacher.get("password") == password
+
+            if same_id and same_password and is_active_teacher(teacher):
+                log_event("login success", {"loginId": login_id})
+                return {"ok": True, "user": teacher}
+
+        log_event("login failed", {"loginId": login_id})
+        return {"ok": False, "message": TEXT_LOGIN_ERROR}
+
+    def teachers(self):
+        data = self.store.load()
+        return data.get("teachers", [])
+
+    def save_teacher(self, teacher_input):
+        teacher = prepare_teacher_input(teacher_input)
+        required_fields = ["teacherId", "name", "loginId"]
+        missing_fields = validate_required_fields(teacher, required_fields)
+
+        if missing_fields:
+            log_event("teacher validation failed", {"missingFields": missing_fields})
+            return {
+                "ok": False,
+                "message": TEXT_REQUIRED_ERROR,
+                "missingFields": missing_fields,
+            }
+
+        saved_teacher = self.store.upsert("teachers", "teacherId", teacher)
+        log_event("teacher saved", {"teacherId": saved_teacher.get("teacherId")})
+        return {"ok": True, "teacher": saved_teacher}
+
+    def teacher_summary(self):
+        teachers = self.teachers()
+        active_teachers = []
+        role_pairs = []
+
+        for number, teacher in enumerate(teachers, 1):
+            role_pairs.append((number, teacher.get("teacherId"), teacher.get("role")))
+
+            if is_active_teacher(teacher):
+                active_teachers.append(teacher)
+
+        role_set = unique_values(teachers, "role")
+
+        return {
+            "total": len(teachers),
+            "active": len(active_teachers),
+            "roles": sorted(list(role_set)),
+            "byRole": count_by_key(teachers, "role"),
+            "rolePairs": role_pairs,
+        }
+
+    def save_shift_request(self, shift_request):
+        saved_shift = self.store.upsert("shiftRequests", "requestId", shift_request)
+        log_event("shift saved", {"requestId": saved_shift.get("requestId")})
+        return saved_shift
+
+    def save_demo_lesson(self, demo_lesson):
+        saved_demo = self.store.upsert("demoLessons", "demoId", demo_lesson)
+        log_event("demo lesson saved", {"demoId": saved_demo.get("demoId")})
+        return saved_demo
+
+    def shift_summary(self):
+        data = self.store.load()
+        shifts = data.get("shiftRequests", [])
+        summary = {"total": 0, "submitted": 0, "byTeacher": {}}
+
+        for shift in shifts:
+            summary["total"] += 1
+            teacher_id = shift.get("teacherId", TEXT_NOT_SET)
+
+            if shift.get("status"):
+                summary["submitted"] += 1
+
+            current_count = summary["byTeacher"].get(teacher_id, 0)
+            summary["byTeacher"][teacher_id] = current_count + 1
+
+        return summary
+
+    def demo_lessons_sorted(self):
+        data = self.store.load()
+        demos = data.get("demoLessons", [])
+        return sorted(demos, key=demo_sort_key)
+
+    def demo_lessons_by_status(self, target_status):
+        result = []
+
+        for demo in self.demo_lessons_sorted():
+            if demo.get("status") == target_status:
+                result.append(demo)
+
+        return result
+
+    def demo_lessons_for_teacher(self, teacher_id):
+        result = []
+
+        for demo in self.demo_lessons_sorted():
+            if demo.get("assignedTeacherId") == teacher_id:
+                result.append(demo)
+
+        return result
+
+    def demo_summary(self):
+        demos = self.demo_lessons_sorted()
+        summary = {
+            "total": len(demos),
+            "unassigned": 0,
+            "waiting": 0,
+            "confirmed": 0,
+            "done": 0,
+            "assignedTeacherCount": 0,
+            "byStatus": {},
+            "shareTextLines": [],
+        }
+
+        assigned_teacher_ids = set()
+        share_text_lines = []
+
+        for demo in demos:
+            status = normalize_text(demo.get("status"), TEXT_NOT_SET)
+            teacher_id = normalize_text(demo.get("assignedTeacherId"))
+            teacher_name = normalize_text(demo.get("assignedTeacherName"), TEXT_UNASSIGNED)
+
+            if status == TEXT_DONE:
+                summary["done"] += 1
+            elif status == TEXT_WAITING:
+                summary["waiting"] += 1
+            elif status == TEXT_CONFIRMED:
+                summary["confirmed"] += 1
+            elif not teacher_id:
+                summary["unassigned"] += 1
+
+            if teacher_id:
+                assigned_teacher_ids.add(teacher_id)
+
+            summary["byStatus"][status] = summary["byStatus"].get(status, 0) + 1
+
+            line = "{} {}{} / {}{} {} {}:{} {}:{}".format(
+                demo.get("date"),
+                TEXT_VISIT,
+                demo.get("visitTime"),
+                TEXT_DEMO,
+                demo.get("demoTime"),
+                demo_public_label(demo),
+                TEXT_TEACHER,
+                teacher_name,
+                TEXT_STATUS,
+                status,
+            )
+            share_text_lines.append(line)
+
+        summary["assignedTeacherCount"] = len(assigned_teacher_ids)
+        summary["shareTextLines"] = share_text_lines
+        summary["bySubject"] = count_by_key(demos, "subject")
+        summary["uniqueSubjects"] = sorted(list(unique_values(demos, "subject")))
+        return summary
+
+    def snapshot(self):
+        data = self.store.load()
+        data["serverTime"] = datetime.now().isoformat()
+        return data
+
+    def sync_all(self, payload):
+        data = self.store.load()
+        allowed_keys = list(default_data().keys())
+        saved_keys = []
+
+        for key, value in payload.items():
+            if key in allowed_keys:
+                data[key] = value
+                saved_keys.append(key)
+
+        self.store.save(data)
+        return saved_keys
+
+
+app = Flask(__name__)
+CORS(app)
+
+store = JsonStore(DATA_FILE)
+service = ShiftLinkService(store)
+
+
+@app.get("/api/health")
+def health():
+    return jsonify({"ok": True, "message": "ShiftLink Python API is running"})
+
+
+@app.get("/api/data")
+def get_data():
+    return jsonify(service.snapshot())
+
+
+@app.post("/api/login")
+def login():
+    payload = get_input_payload()
+    result = service.authenticate(payload.get("loginId", ""), payload.get("password", ""))
+    status_code = 200 if result["ok"] else 401
+    return jsonify(result), status_code
+
+
+@app.get("/api/teachers")
+def get_teachers():
+    return jsonify({"ok": True, "teachers": service.teachers()})
+
+
+@app.get("/api/teachers/summary")
+def get_teacher_summary():
+    return jsonify(service.teacher_summary())
+
+
+@app.post("/api/teachers")
+def save_teacher():
+    teacher = get_input_payload()
+    result = service.save_teacher(teacher)
+    status_code = 200 if result["ok"] else 400
+    return jsonify(result), status_code
+
+
+@app.post("/api/shifts")
+def save_shift():
+    shift_request = get_input_payload()
+    return jsonify({"ok": True, "shiftRequest": service.save_shift_request(shift_request)})
+
+
+@app.get("/api/shifts/summary")
+def get_shift_summary():
+    return jsonify(service.shift_summary())
+
+
+@app.post("/api/demo-lessons")
+def save_demo():
+    demo_lesson = get_input_payload()
+    return jsonify({"ok": True, "demoLesson": service.save_demo_lesson(demo_lesson)})
+
+
+@app.get("/api/demo-lessons")
+def get_demo_lessons():
+    teacher_id = normalize_text(request.args.get("teacherId"))
+    status = normalize_text(request.args.get("status"))
+
+    if teacher_id:
+        demos = service.demo_lessons_for_teacher(teacher_id)
+    elif status:
+        demos = service.demo_lessons_by_status(status)
+    else:
+        demos = service.demo_lessons_sorted()
+
+    return jsonify({"ok": True, "demoLessons": demos})
+
+
+@app.get("/api/demo-lessons/summary")
+def get_demo_summary():
+    return jsonify(service.demo_summary())
+
+
+@app.post("/api/sync")
+def sync_all():
+    payload = get_input_payload()
+    saved_keys = service.sync_all(payload)
+    log_event("sync saved", {"savedKeys": saved_keys})
+    return jsonify({"ok": True, "savedKeys": saved_keys})
+
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=True)
