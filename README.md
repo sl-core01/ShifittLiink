@@ -21,21 +21,8 @@ The backend is added with Python Flask in `backend.py`.
 - `shiftlink_data.json`
   - JSON data file created automatically when the backend runs
 
-## Python Topics Used
 
-| Topic | How it is used |
-|---|---|
-| variable | `DATA_FILE`, `app`, `store`, `service` |
-| list | `teachers`, `shiftRequests`, `demoLessons`, `required_fields`, `missing_fields`, `input_items` |
-| dict | teacher data, shift data, demo lesson data, summary data |
-| tuple | demo lesson sort key and teacher input pairs such as `("name", "")` |
-| set | unique assigned teacher IDs |
-| if / elif / else | login check, required input check, demo lesson status check |
-| for | `range(0, 10)`, `enumerate()`, `.items()`, and list loops |
-| function | `default_data()`, `normalize_text()`, `generate_password()`, `prepare_teacher_input()` |
-| JSON I/O | load and save `shiftlink_data.json` |
-| class / OOP | `JsonStore`, `ShiftLinkService` |
-| random | random password generation for teacher registration |
+
 
 ## Class Topic Map
 
